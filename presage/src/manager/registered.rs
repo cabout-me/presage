@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
 use futures::{future, AsyncReadExt, Stream, StreamExt};
@@ -11,7 +11,7 @@ use libsignal_service::provisioning::ProvisioningSecrets;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
-    configuration::{ServiceConfiguration, SignalServers},
+    configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
@@ -30,7 +30,9 @@ use libsignal_service::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{
+        HttpAuthOverride, PushService, ServiceError, ServiceIds, DEFAULT_DEVICE_ID,
+    },
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -51,6 +53,7 @@ use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
 };
 use rand::rng;
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -66,6 +69,17 @@ pub use crate::model::messages::Received;
 
 type ServiceCipher<S> = cipher::ServiceCipher<S>;
 type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
+
+/// What the primary device answered to a history archive request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferArchive {
+    /// The archive sits on `cdn` under the transit `key`.
+    Ready { cdn: u32, key: String },
+    /// The primary device wants the user to link again.
+    RelinkRequested,
+    /// The primary device will not upload a history.
+    ContinueWithoutUpload,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationType {
@@ -1356,6 +1370,66 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         Ok(ciphertext)
+    }
+
+    /// Long-polls for the history archive a primary device uploads after linking.
+    /// `None` means the poll timed out and can be repeated.
+    pub async fn transfer_archive(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<TransferArchive>, Error<S::Error>> {
+        #[derive(Deserialize)]
+        struct Body {
+            cdn: Option<u32>,
+            key: Option<String>,
+            error: Option<String>,
+        }
+
+        let service = self.identified_push_service();
+        let response = service
+            .request(
+                Method::GET,
+                Endpoint::service(format!(
+                    "/v1/devices/transfer_archive?timeout={}",
+                    timeout.as_secs()
+                )),
+                HttpAuthOverride::NoOverride,
+            )?
+            .timeout(timeout + Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(ServiceError::from)?;
+
+        let status = response.status();
+        match status.as_u16() {
+            204 => return Ok(None),
+            200 => {}
+            401 | 403 => return Err(ServiceError::Unauthorized.into()),
+            413 | 429 => {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .map(chrono::Duration::seconds);
+                return Err(ServiceError::RateLimitExceeded { retry_after }.into());
+            }
+            _ => {
+                let body = response.text().await.map_err(ServiceError::from)?;
+                return Err(ServiceError::UnhandledResponseCode { status, body }.into());
+            }
+        }
+
+        let body = response.text().await.map_err(ServiceError::from)?;
+        let parsed: Body = serde_json::from_str(&body).map_err(ServiceError::from)?;
+        match (parsed.error.as_deref(), parsed.cdn, parsed.key) {
+            (Some("RELINK_REQUESTED"), _, _) => Ok(Some(TransferArchive::RelinkRequested)),
+            (Some("CONTINUE_WITHOUT_UPLOAD"), _, _) => {
+                Ok(Some(TransferArchive::ContinueWithoutUpload))
+            }
+            (None, Some(cdn), Some(key)) => Ok(Some(TransferArchive::Ready { cdn, key })),
+            _ => Err(ServiceError::UnhandledResponseCode { status, body }.into()),
+        }
     }
 
     /// Gets the metadata of a sticker
