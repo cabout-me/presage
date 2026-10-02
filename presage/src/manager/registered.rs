@@ -1692,6 +1692,15 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// As a linked (secondary) device, remove this device from the account.
+    pub async fn unlink_self(&self) -> Result<(), Error<S::Error>> {
+        self.identified_websocket(false)
+            .await?
+            .unlink_device(self.state.device_id())
+            .await?;
+        Ok(())
+    }
+
     /// As a primary device, list all the devices (including the current device).
     pub async fn devices(&self) -> Result<Vec<DeviceInfo>, Error<S::Error>> {
         let aci_protocol_store = self.store.aci_protocol_store();
